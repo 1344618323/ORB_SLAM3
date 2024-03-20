@@ -254,6 +254,11 @@ public:
 
 
 // Gravity direction vertex
+/*
+考虑到重力向量只有2个自由度（两维向量，但是norm值固定为9.81），怎么建模是个问题:
+知乎上有讨论 https://zhuanlan.zhihu.com/p/616467806 ，有空仔细研究一波。
+ORB3的这个建模方式我还没看到足够通透的解释，不知道到底行不行。
+*/
 class GDirection
 {
 public:
@@ -726,6 +731,7 @@ public:
     Eigen::Vector3d vwb;
     Eigen::Vector3d bg;
     Eigen::Vector3d ba;
+    // 先验信息矩阵
     Matrix15d H;
 };
 

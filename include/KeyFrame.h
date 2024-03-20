@@ -49,6 +49,13 @@ class KeyFrameDatabase;
 
 class GeometricCamera;
 
+/*
+我是觉得和Frame可以弄成一个类啦
+也是一堆mutex保证多线程的读写安全
+
+与frame的区别在与缓存了共视帧信息
+std::vector<KeyFrame*> mvpOrderedConnectedKeyFrames;
+*/
 class KeyFrame
 {
     friend class boost::serialization::access;
@@ -258,6 +265,7 @@ public:
     MapPoint* GetMapPoint(const size_t &idx);
 
     // KeyPoint functions
+    // 找出像素坐标xy附近范围r以内的ORB kpts
     std::vector<size_t> GetFeaturesInArea(const float &x, const float  &y, const float  &r, const bool bRight = false) const;
     bool UnprojectStereo(int i, Eigen::Vector3f &x3D);
 
@@ -308,8 +316,11 @@ public:
     // The following variables are accesed from only 1 thread or never change (no mutex needed).
 public:
 
+    // kf自己的id
     static long unsigned int nNextId;
     long unsigned int mnId;
+
+    // kf是从frame构建的，kf对应的frame的id
     const long unsigned int mnFrameId;
 
     const double mTimeStamp;
@@ -325,7 +336,9 @@ public:
     long unsigned int mnFuseTargetForKF;
 
     // Variables used by the local mapping
+    // 记录是因为关联了哪个kf，被BAlocal了
     long unsigned int mnBALocalForKF;
+    // 记录是因为关联了哪个kf，被BAfix了
     long unsigned int mnBAFixedForKF;
 
     //Number of optimizations by BA(amount of iterations in BA)
@@ -446,6 +459,7 @@ protected:
     IMU::Bias mImuBias;
 
     // MapPoints associated to keypoints
+    // 和keypoints使用同一个索引，意味着里面会有不少nullptr
     std::vector<MapPoint*> mvpMapPoints;
     // For save relation without pointer, this is necessary for save/load function
     std::vector<long long int> mvBackupMapPointsId;
@@ -457,9 +471,12 @@ protected:
     // Grid over the image to speed up feature matching
     std::vector< std::vector <std::vector<size_t> > > mGrid;
 
+    // mConnectedKeyFrameWeights 像一个中间变量
     std::map<KeyFrame*,int> mConnectedKeyFrameWeights;
+    // 下面连个是重点，Vector是一一对应的，mvOrderedWeights记录了共视点数量，从大到小排列
     std::vector<KeyFrame*> mvpOrderedConnectedKeyFrames;
     std::vector<int> mvOrderedWeights;
+
     // For save relation without pointer, this is necessary for save/load function
     std::map<long unsigned int, int> mBackupConnectedKeyFrameIdWeights;
 

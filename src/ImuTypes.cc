@@ -99,6 +99,9 @@ IntegratedRotation::IntegratedRotation(const Eigen::Vector3f &angVel, const Bias
     }
     else
     {
+        // 罗德里格斯公式： dR = exp(d \theta)
+        // J_r(d \theta)
+        // 这代码重复得太多了~~
         deltaR = Eigen::Matrix3f::Identity() + W*sin(d)/d + W*W*(1.0f-cos(d))/d2;
         rightJ = Eigen::Matrix3f::Identity() - W*(1.0f-cos(d))/d2 + W*W*(d-sin(d))/(d2*d);
     }
@@ -183,6 +186,7 @@ void Preintegrated::IntegrateNewMeasurement(const Eigen::Vector3f &acceleration,
     // Rotation is the last to be updated.
 
     //Matrices to compute covariance
+    // eta_{ij} = A eta_{i,j-1} + B eta_{s}, A B矩阵最终用于更新预积分的协方差矩阵
     Eigen::Matrix<float,9,9> A;
     A.setIdentity();
     Eigen::Matrix<float,9,6> B;

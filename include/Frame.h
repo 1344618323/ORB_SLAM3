@@ -50,6 +50,30 @@ class ConstraintPoseImu;
 class GeometricCamera;
 class ORBextractor;
 
+/*
+重要成员：
+
+std::vector<cv::KeyPoint> mvKeys, mvKeysRight; // 左目orbkpts，右目orbkpts
+std::vector<MapPoint*> mvpMapPoints; // mvKeys 与 mvMapPoints 等长。左目orbkpts 对应的 mappts。
+std::vector<float> mvuRight; // mvKeys 匹配到的右目u'
+std::vector<float> mvDepth; // mvKeys 由mvuRight算出的深度
+std::vector<std::size_t> mGrid[48][64], mGridRight[48][64] // 将图像分成48*64个网格，分别将左右目orbkpts的索引放到里面。方便投影搜索
+
+
+Frame(cv::Mat& imLeft, cv::Mat& imRight, ...) // 构造函数
+1. 双线程分别提取左、右目orbkpts。提取方法见 ORBextractor::operator()
+    kpt的关键参数
+    1. x/y: 像素坐标，有整数、有浮点数（ORB本身是FAST改进，是整数，但由于多分辨是浮点数）
+    2. octave， 所属pyramid，从0开始、分辨率越来越低
+    3. angle： 质心
+    4. desp： 质心转正后的描述符
+2. 匹配左右目orbkpts，见ComputeStereoMatches()，大致思路：
+    1. 多条平行线搜索右目octave相近、desp最近的kpt，确定u大致范围
+    2. 固定v，左目kpt那一层pyramid使用SAD块匹配，确定(u,v)
+    3. (u-1,v)、(u,v)、(u+1,v) 二次曲线，求(u',v)
+    4. 求视差、深度
+    注意：匹配过程不会更改mvKeysRight，但会写mvuRight、mvDepth
+*/
 class Frame
 {
 public:
@@ -121,6 +145,7 @@ public:
     // Backprojects a keypoint (if stereo/depth info available) into 3D world coordinates.
     bool UnprojectStereo(const int &i, Eigen::Vector3f &x3D);
 
+    // 追踪本帧时得到的pvq，以及误差信息矩阵
     ConstraintPoseImu* mpcpi;
 
     bool imuIsPreintegrated();
@@ -251,6 +276,7 @@ public:
     static float mfGridElementHeightInv;
     std::vector<std::size_t> mGrid[FRAME_GRID_COLS][FRAME_GRID_ROWS];
 
+    // 没啥卵用的变量
     IMU::Bias mPredBias;
 
     // IMU bias
@@ -265,6 +291,7 @@ public:
 
     // Pointer to previous frame
     Frame* mpPrevFrame;
+    // 基于上一帧的bias做的预积分
     IMU::Preintegrated* mpImuPreintegratedFrame;
 
     // Current and Next Frame id.
@@ -328,6 +355,8 @@ public:
     //Number of KeyPoints extracted in the left and right images
     int Nleft, Nright;
     //Number of Non Lapping Keypoints
+    // 对于针孔相机来说，这两个没啥用。monoLeft==左相机所有的kpt总数；monoRight==右相机所有的kpt总数
+    // 但对于鱼眼相机是有用的
     int monoLeft, monoRight;
 
     //For stereo matching

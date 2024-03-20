@@ -124,6 +124,19 @@ namespace ORB_SLAM3 {
         }
     }
 
+    /*
+    1. 配置相机模型：在ORBSLAM3中，
+        对于针孔相机，单目模式喂给SLAM的图像应该是undistort
+                    双目模式喂给SLAM的图像应该是rectify
+    2. 配置IMU：
+        4个标准差：
+            NoiseAcc/NoiseGyro查厂家的IMU data-sheet
+            Accwalk/Gyrowalk: 在calibration tutorial中，作者提到：
+                It is common practice to increase the random walk standard deviations provided by the IMU manufacturer 
+                (say multiplying them by 10) to account for unmodelled effects and improving the IMU initialization convergence.
+                常用的一个trick：对厂家提供的标准差乘10
+        程序中Tbc是Imu到rectify后的lcam的转换
+    */
     Settings::Settings(const std::string &configFile, const int& sensor) :
     bNeedToUndistort_(false), bNeedToRectify_(false), bNeedToResize1_(false), bNeedToResize2_(false) {
         sensor_ = sensor;
@@ -499,6 +512,8 @@ namespace ORB_SLAM3 {
         cv::Mat R_r1_u1, R_r2_u2;
         cv::Mat P1, P2, Q;
 
+        // K1,K2是原始图像尺寸originalImSize_下的内参，要缩放到newImSize_，并作立体矫正
+        // 这个函数调用中中的第三个参数不应该是newImSize_，而该是originalImSize_！
         cv::stereoRectify(K1,camera1DistortionCoef(),K2,camera2DistortionCoef(),newImSize_,
                           R12, t12,
                           R_r1_u1,R_r2_u2,P1,P2,Q,
@@ -522,6 +537,7 @@ namespace ORB_SLAM3 {
             Eigen::Matrix3f eigenR_r1_u1;
             cv::cv2eigen(R_r1_u1,eigenR_r1_u1);
             Sophus::SE3f T_r1_u1(eigenR_r1_u1,Eigen::Vector3f::Zero());
+            // 所以配置文件中应该写rectify前的body2cam
             Tbc_ = Tbc_ * T_r1_u1.inverse();
         }
     }

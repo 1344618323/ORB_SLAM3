@@ -38,6 +38,13 @@ namespace ORB_SLAM3
 
 Verbose::eLevel Verbose::th = Verbose::VERBOSITY_NORMAL;
 
+/*
+四条线程：
+1. exe主线程： call system::Track...
+2. LocalMapping
+3. 回环
+4. viewer
+*/
 System::System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor,
                const bool bUseViewer, const int initFr, const string &strSequence):
     mSensor(sensor), mpViewer(static_cast<Viewer*>(NULL)), mbReset(false), mbResetActiveMap(false),
@@ -122,6 +129,8 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
             cerr << "Falied to open at: " << strVocFile << endl;
             exit(-1);
         }
+
+        cout << "Vocabulary loaded! Info: " << *mpVocabulary << endl << endl;
         cout << "Vocabulary loaded!" << endl << endl;
 
         //Create KeyFrame Database
@@ -237,10 +246,15 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     }
 
     // Fix verbosity
-    Verbose::SetTh(Verbose::VERBOSITY_QUIET);
+    // Verbose::SetTh(Verbose::VERBOSITY_QUIET);
+    Verbose::SetTh(Verbose::VERBOSITY_DEBUG);
 
 }
 
+/*
+1. 双目rectify
+2. 构建Frame OBJ时，完成ORB提取 与 深度计算
+*/
 Sophus::SE3f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::Point>& vImuMeas, string filename)
 {
     if(mSensor!=STEREO && mSensor!=IMU_STEREO)

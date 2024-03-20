@@ -1451,6 +1451,10 @@ bool Tracking::GetStepByStep()
 
 
 
+/*
+1.构建Frameobj时，完成ORB提取与深度计算
+2.track()
+*/
 Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat &imRectRight, const double &timestamp, string filename)
 {
     //cout << "GrabImageStereo" << endl;
@@ -1490,6 +1494,7 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
 
     //cout << "Incoming frame creation" << endl;
 
+    // mpCamera2 只有在配置鱼眼相机才有值
     if (mSensor == System::STEREO && !mpCamera2)
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera);
     else if(mSensor == System::STEREO && mpCamera2)
@@ -1640,6 +1645,7 @@ void Tracking::PreintegrateIMU()
         return;
     }
 
+    // 最终mvImuFromLastFrame序列的 start_t/end_t应该满足： prevframe_t  <= strat_t < ... curframe_t <= end_t
     while(true)
     {
         bool bSleep = false;
@@ -1688,6 +1694,10 @@ void Tracking::PreintegrateIMU()
         Eigen::Vector3f acc, angVel;
         if((i==0) && (i<(n-1)))
         {
+            // prevframe_t  <= t[0] < t[1]
+            //              已知a[0]   a[1]
+            // 通过线性插值得到 prevframe_t 时刻的a: mvImuFromLastFrame[i].a - (mvImuFromLastFrame[i+1].a-mvImuFromLastFrame[i].a)*(tini/tab)
+            // 最后 prevframe_t 时刻的a 和 t[1]时刻的a，取均值，作为 prevframe_t到t[1] 时刻的 a
             float tab = mvImuFromLastFrame[i+1].t-mvImuFromLastFrame[i].t;
             float tini = mvImuFromLastFrame[i].t-mCurrentFrame.mpPrevFrame->mTimeStamp;
             acc = (mvImuFromLastFrame[i].a+mvImuFromLastFrame[i+1].a-
@@ -1725,16 +1735,21 @@ void Tracking::PreintegrateIMU()
         pImuPreintegratedFromLastFrame->IntegrateNewMeasurement(acc,angVel,tstep);
     }
 
+    // 从lastframe开始的预积分
     mCurrentFrame.mpImuPreintegratedFrame = pImuPreintegratedFromLastFrame;
+    // 从lastkeyframe开始的预积分
     mCurrentFrame.mpImuPreintegrated = mpImuPreintegratedFromLastKF;
     mCurrentFrame.mpLastKeyFrame = mpLastKeyFrame;
 
+    // 完成预积分的标志位？
     mCurrentFrame.setIntegrated();
 
     //Verbose::PrintMess("Preintegration is finished!! ", Verbose::VERBOSITY_DEBUG);
 }
 
 
+// 若最近localmapping有更新，就用lastkf的imu递推
+// 若没有，就用lastframe的imu递推
 bool Tracking::PredictStateIMU()
 {
     if(!mCurrentFrame.mpPrevFrame)
@@ -1791,6 +1806,29 @@ void Tracking::ResetFrameIMU()
 }
 
 
+/*
+mState最开始是 NO_IMAGES_YET；
+接着变成NOT_INITIALIZED；
+完成初始化后，变成OK；
+
+if NOT_INITIALIZED:
+    StereoInitialization: 把双目测量结果作为mappoints
+    MonocularInitialization： 有了足够多match，分别计算H和E，选分高的recover Rt，并三角化mappoints
+else:
+    step1: curframe先与lastframe的mappoints进行match，并pnp
+    if 没速度 && imu没初始化：
+        TrackReferenceKeyFrame(); //暴力匹配 curframe 和 lastframe
+    else:
+        if(!TrackWithMotionModel()) // 通过运动模型预测curframepose（有imu用imu，没有就用前后帧位姿变换）， 投影匹配 curframe 和 lastframe
+            TrackReferenceKeyFrame();
+    
+    step2: 凭借上一步curframe收获的mappoint，找到与其共视的kf，以及这些kf观测的所有mappoint；
+            先验投影匹配 curframe 和 这些mappoints；最后pnp优化位姿
+    TrackLocalMap()
+
+    step3: 创建新关键帧；如果是双目还会创建新mappoint
+    CreateNewKeyFrame()
+*/
 void Tracking::Track()
 {
 
@@ -1815,6 +1853,7 @@ void Tracking::Track()
         cout << "ERROR: There is not an active map in the atlas" << endl;
     }
 
+    // 比较当前帧与前一帧的时间戳，处理不正常情况
     if(mState!=NO_IMAGES_YET)
     {
         if(mLastFrame.mTimeStamp>mCurrentFrame.mTimeStamp)
@@ -1885,6 +1924,7 @@ void Tracking::Track()
     // Get Map Mutex -> Map cannot be changed
     unique_lock<mutex> lock(pCurrentMap->mMutexMapUpdate);
 
+    // 在追踪当前帧前，先查看 mappoint 最近是不是有变化
     mbMapUpdated = false;
 
     int nCurMapChangeIndex = pCurrentMap->GetMapChangeIndex();
@@ -2332,6 +2372,10 @@ void Tracking::Track()
 }
 
 
+/*
+curframe要有足够的kpts，且相对lastframe要有一定的acc变化（why），才能初始化
+所谓初始化也很简单，就是把双目测量的pts放入地图中
+*/
 void Tracking::StereoInitialization()
 {
     if(mCurrentFrame.N>500)
@@ -2501,6 +2545,7 @@ void Tracking::MonocularInitialization()
         Sophus::SE3f Tcw;
         vector<bool> vbTriangulated; // Triangulated Correspondences (mvIniMatches)
 
+        // 基于E或者H，完成recoverpose，并三角化
         if(mpCamera->ReconstructWithTwoViews(mInitialFrame.mvKeysUn,mCurrentFrame.mvKeysUn,mvIniMatches,Tcw,mvIniP3D,vbTriangulated))
         {
             for(size_t i=0, iend=mvIniMatches.size(); i<iend;i++)
@@ -2572,11 +2617,13 @@ void Tracking::CreateInitialMapMonocular()
     pKFini->UpdateConnections();
     pKFcur->UpdateConnections();
 
+    // 没啥卵用的两行代码
     std::set<MapPoint*> sMPs;
     sMPs = pKFini->GetMapPoints();
 
     // Bundle Adjustment
     Verbose::PrintMess("New Map created with " + to_string(mpAtlas->MapPointsInMap()) + " points", Verbose::VERBOSITY_QUIET);
+    // 固定pkFini，优化pkFcur以及所有mappoint
     Optimizer::GlobalBundleAdjustemnt(mpAtlas->GetCurrentMap(),20);
 
     float medianDepth = pKFini->ComputeSceneMedianDepth(2);
@@ -2778,6 +2825,7 @@ bool Tracking::TrackReferenceKeyFrame()
         return nmatchesMap>=10;
 }
 
+// lastframe参考的关键帧pose可能在localmapping中变了，因此要修正下
 void Tracking::UpdateLastFrame()
 {
     // Update pose according to reference keyframe
@@ -2785,9 +2833,11 @@ void Tracking::UpdateLastFrame()
     Sophus::SE3f Tlr = mlRelativeFramePoses.back();
     mLastFrame.SetPose(Tlr * pRef->GetPose());
 
+    // slam模式到这里就返回了
     if(mnLastKeyFrameId==mLastFrame.mnId || mSensor==System::MONOCULAR || mSensor==System::IMU_MONOCULAR || !mbOnlyTracking)
         return;
 
+    // 双目定位模式会跑下面的代码，先不管
     // Create "visual odometry" MapPoints
     // We sort points according to their measured depth by the stereo/RGB-D sensor
     vector<pair<float,int> > vDepthIdx;
@@ -2946,6 +2996,12 @@ bool Tracking::TrackWithMotionModel()
         return nmatchesMap>=10;
 }
 
+/*
+找出当前帧的共视kf，并搜罗出这些kf的mappoints，与frame中的kpts作匹配，从而实现更精确的pnp。pnp方法：
+1. 若没有IMU，则是BA
+2. 若有IMU，但localmapping中对地图有操作：PoseInertialOptimizationLastKeyFrame
+3. 若有IMU，但localmapping中没对地图有操作：PoseInertialOptimizationLastFrame
+*/
 bool Tracking::TrackLocalMap()
 {
 
@@ -3065,6 +3121,7 @@ bool Tracking::NeedNewKeyFrame()
 {
     if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !mpAtlas->GetCurrentMap()->isImuInitialized())
     {
+        // 若IMU没初始化，就0.25s创建一个关键帧
         if (mSensor == System::IMU_MONOCULAR && (mCurrentFrame.mTimeStamp-mpLastKeyFrame->mTimeStamp)>=0.25)
             return true;
         else if ((mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && (mCurrentFrame.mTimeStamp-mpLastKeyFrame->mTimeStamp)>=0.25)
@@ -3213,6 +3270,10 @@ bool Tracking::NeedNewKeyFrame()
         return false;
 }
 
+/*
+创建新关键帧；
+如果是双目还会创建新的mappoint；但考虑到对于双目而言，远距离点测距精度低，所有不会创建所有双目观测到的点，而是限制到maxPoint（100）个
+*/
 void Tracking::CreateNewKeyFrame()
 {
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
@@ -3244,6 +3305,7 @@ void Tracking::CreateNewKeyFrame()
         mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKF->GetImuBias(),pKF->mImuCalib);
     }
 
+    // 双目会进入这个if语句中，单目不会
     if(mSensor!=System::MONOCULAR && mSensor != System::IMU_MONOCULAR) // TODO check if incluide imu_stereo
     {
         mCurrentFrame.UpdatePoseMatrices();
@@ -3269,6 +3331,7 @@ void Tracking::CreateNewKeyFrame()
 
         if(!vDepthIdx.empty())
         {
+            // 深度从小到大
             sort(vDepthIdx.begin(),vDepthIdx.end());
 
             int nPoints = 0;
@@ -3280,9 +3343,11 @@ void Tracking::CreateNewKeyFrame()
 
                 MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
                 if(!pMP)
+                    // 双目测到的新mappoint
                     bCreateNew = true;
                 else if(pMP->Observations()<1)
                 {
+                    // 啥情况下，会到这里？
                     bCreateNew = true;
                     mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint*>(NULL);
                 }
@@ -3340,6 +3405,9 @@ void Tracking::CreateNewKeyFrame()
     mpLastKeyFrame = pKF;
 }
 
+/*
+从共视帧中的mappoint中 找出与 curframe kpt 匹配的地图点
+*/
 void Tracking::SearchLocalPoints()
 {
     // Do not search map points already matched
@@ -3414,6 +3482,7 @@ void Tracking::SearchLocalPoints()
     }
 }
 
+// 找出当前帧的所有共视kf，以及这些kf的mappoint
 void Tracking::UpdateLocalMap()
 {
     // This is for visualization
@@ -3454,12 +3523,20 @@ void Tracking::UpdateLocalPoints()
 }
 
 
+/*
+找出当前帧的共视kf，筛出mvpLocalKeyFrames；
+找出其中共视点最多的帧作为当前帧的mpReferenceKF
+*/
 void Tracking::UpdateLocalKeyFrames()
 {
     // Each map point vote for the keyframes in which it has been observed
     map<KeyFrame*,int> keyframeCounter;
     if(!mpAtlas->isImuInitialized() || (mCurrentFrame.mnId<mnLastRelocFrameId+2))
     {
+        /*
+        处在初始化阶段：
+        keyframeCounter[pKF] = 观测到mCurrentFrame中地图点的 次数
+        */
         for(int i=0; i<mCurrentFrame.N; i++)
         {
             MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
@@ -3525,6 +3602,7 @@ void Tracking::UpdateLocalKeyFrames()
         }
 
         mvpLocalKeyFrames.push_back(pKF);
+        // 不是我说，这样把中间变量塞成对象的成员变量真的好吗？
         pKF->mnTrackReferenceForFrame = mCurrentFrame.mnId;
     }
 

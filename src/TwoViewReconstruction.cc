@@ -102,6 +102,7 @@ namespace ORB_SLAM3
         float SH, SF;
         Eigen::Matrix3f H, F;
 
+        // 看这两句代码时，要注意学习 怎么把 这两个的score 统一起来
         thread threadH(&TwoViewReconstruction::FindHomography,this,ref(vbMatchesInliersH), ref(SH), ref(H));
         thread threadF(&TwoViewReconstruction::FindFundamental,this,ref(vbMatchesInliersF), ref(SF), ref(F));
 
@@ -214,6 +215,14 @@ namespace ORB_SLAM3
                 vPn2i[j] = vPn2[mvMatches12[idx].second];
             }
 
+            /*
+            x2=T2p2
+            x1=T1p1
+
+            x2t Fn x1 = 0
+
+            F21 = T2t Fn T1
+            */
             Eigen::Matrix3f Fn = ComputeF21(vPn1i,vPn2i);
 
             F21i = T2t * Fn * T1;
@@ -410,6 +419,7 @@ namespace ORB_SLAM3
 
         float score = 0;
 
+        // 点到线距离，只有一个自由度，所以为3.841
         const float th = 3.841;
         const float thScore = 5.991;
 
@@ -517,6 +527,7 @@ namespace ORB_SLAM3
             nsimilar++;
 
         // If there is not a clear winner or not enough triangulated points reject initialization
+        // 非极大值抑制
         if(maxGood<nMinGood || nsimilar>1)
         {
             return false;
@@ -568,6 +579,77 @@ namespace ORB_SLAM3
         return false;
     }
 
+    // 偷个懒，直接粘贴自 https://github.com/electech6/ORB_SLAM3_detailed_comments
+    /**
+     * @brief 从H恢复R t
+     * H矩阵分解常见有两种方法：Faugeras SVD-based decomposition 和 Zhang SVD-based decomposition
+     * 参考文献：Motion and structure from motion in a piecewise plannar environment
+     * 这篇参考文献和下面的代码使用了Faugeras SVD-based decomposition算法
+     * @see
+     * - Faugeras et al, Motion and structure from motion in a piecewise planar environment. International Journal of Pattern Recognition and Artificial Intelligence, 1988.
+     * - Deeper understanding of the homography decomposition for vision-based control
+     * 设平面法向量 n = (a, b, c)^t 有一点(x, y, z)在平面上，则ax + by + cz = d  即 1/d * n^t * x = 1 其中d表示
+     * x' = R*x + t  从下面开始x 与 x'都表示归一化坐标
+     * λ2*x' = R*(λ1*x) + t = R*(λ1*x) + t * 1/d * n^t * (λ1*x)
+     * x' = λ*(R + t * 1/d * n^t) * x = H^ * x
+     * 对应图像坐标   u' = G * u   G = KH^K.inv
+     * H^ ~=  d*R + t * n^t = U∧V^t    ∧ = U^t * H^ * V = d*U^t * R * V + (U^t * t) * (V^t * n)^t
+     * s = det(U) * det(V)  s 有可能是 1 或 -1  ∧ = s^2 * d*U^t * R * V + (U^t * t) * (V^t * n)^t = (s*d) * s * U^t * R * V + (U^t * t) * (V^t * n)^t
+     * 令 R' = s * U^t * R * V      t' = U^t * t   n' = V^t * n    d' = s * d
+     * ∧ = d' * R' + t' * n'^t    所以∧也可以认为是一个单应矩阵，其中加入s只为说明有符号相反的可能 
+     * 设∧ = | d1, 0, 0 |    取e1 = (1, 0, 0)^t   e2 = (0, 1, 0)^t   e3 = (0, 0, 1)^t
+     *      | 0, d2, 0 |
+     *      | 0, 0, d3 |
+     * n' = (a1, 0, 0)^t + (0, b1, 0)^t + (0, 0, c1)^t = a1*e1 + b1*e2 + c1*e3
+     * 
+     * ∧ = [d1*e1, d2*e2, d3*e3] = [d' * R' * e1, d' * R' * e2, d' * R' * e3] + [t' * a1, t' * b1, t' * c1]
+     * ==> d1*e1 = d' * R' * e1 + t' * a1
+     *     d2*e2 = d' * R' * e2 + t' * b1
+     *     d3*e3 = d' * R' * e3 + t' * c1
+     * 
+     * 
+     * 上面式子每两个消去t可得
+     * d'R'(b1e1 - a1e2) = d1b1e1 - d2a1e2
+     * d'R'(c1e2 - b1e3) = d2c1e1 - d3b1e3          同时取二范数，因为旋转对二范数没影响，所以可以约去
+     * d'R'(a1e3 - c1e1) = d3a1e3 - d1c1e1
+     * 
+     * (d'^2 - d2^2)*a1^2 + (d'^2 - d1^2)*b1^2 = 0
+     * (d'^2 - d3^2)*b1^2 + (d'^2 - d2^2)*c1^2 = 0   令 d'^2 - d1^2 = x1       d'^2 - d2^2 = x2       d'^2 - d3^2 = x3 
+     * (d'^2 - d1^2)*c1^2 + (d'^2 - d3^2)*a1^2 = 0
+     * 
+     * 
+     * | x2  x1  0 |     | a1^2 |
+     * | 0   x3 x2 |  *  | b1^2 |  =  0    ===>  x1 * x2 * x3 = 0      有(d'^2 - d1^2) * (d'^2 - d2^2) * (d'^2 - d3^2) = 0   
+     * | x3  0  x1 |     | c1^2 |
+     * 由于d1 >= d2 >= d3  所以d' = d2 or -d2
+     * 
+     * -----------------------------------------------------------------------------------------------------------------------------------------------------------------
+     * 下面分情况讨论，当d' > 0   再根据a1^2 + b1^2 + c1^2 = 1  ??????哪来的根据，不晓得
+     * 能够求得a1 = ε1 * sqrt((d1^2 - d2^2) / (d1^2 - d3^2))
+     *       b1 = 0
+     *       c1 = ε2 * sqrt((d2^2 - d3^2) / (d1^2 - d3^2))  其中ε1 ε2  可以为正负1
+     * 结果带入 d2*e2 = d' * R' * e2 + t' * b1    => R' * e2 = e2
+     *           | cosθ 0 -sinθ |
+     * ==> R' =  |  0   1   0   |      n'  与   R' 带入  d'R'(a1e3 - c1e1) = d3a1e3 - d1c1e1
+     *           | sinθ 0  cosθ |
+     *      | cosθ 0 -sinθ |   | -c1 |    | -d1c1 |
+     * d' * |  0   1   0   | * |  0  | =  |   0   |   能够解出 sinθ  与 cosθ
+     *      | sinθ 0  cosθ |   |  a1 |    |  d3a1 |
+     * 
+     * 到此为止得到了 R'   再根据 d1*e1 = d' * R' * e1 + t' * a1
+     *                         d2*e2 = d' * R' * e2 + t' * b1
+     *                         d3*e3 = d' * R' * e3 + t' * c1
+     * 
+     * 求得 t' = (d1 - d3) * (a1, 0, c1)^t
+     * @param vbMatchesInliers 匹配是否合法，大小为mvMatches12
+     * @param H21 顾名思义
+     * @param K 相机内参
+     * @param T21 旋转平移（要输出的）
+     * @param vP3D 恢复的三维点（要输出的）
+     * @param vbTriangulated 大小与vbMatchesInliers，表示哪个点被重建了
+     * @param minParallax 1
+     * @param minTriangulated 50
+     */
     bool TwoViewReconstruction::ReconstructH(vector<bool> &vbMatchesInliers, Eigen::Matrix3f &H21, Eigen::Matrix3f &K,
                                              Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated, float minParallax, int minTriangulated)
     {
@@ -727,6 +809,9 @@ namespace ORB_SLAM3
             T21 = Sophus::SE3f(vR[bestSolutionIdx], vt[bestSolutionIdx]);
             vbTriangulated = bestTriangulated;
 
+            // 源码应该是少了一句代码
+            // vP3D = bestP3D;
+
             return true;
         }
 
@@ -734,6 +819,11 @@ namespace ORB_SLAM3
     }
 
 
+    /*
+    对二维点集，作规范化，并求出一个规范化矩阵T，有：
+    Tp = p'
+    p为原坐标，p'为规范化坐标
+    */
     void TwoViewReconstruction::Normalize(const vector<cv::KeyPoint> &vKeys, vector<cv::Point2f> &vNormalizedPoints, Eigen::Matrix3f &T)
     {
         float meanX = 0;
@@ -889,6 +979,9 @@ namespace ORB_SLAM3
 
         if(nGood>0)
         {
+            // 3d点到O1、O2方向向量的夹角
+            // 夹角越大，vCosParallax越小，排序后 vCosParallax 表示了夹角从大到小
+            // 夹角越小，三角化精度越低。所以只保留夹角较大的匹配点
             sort(vCosParallax.begin(),vCosParallax.end());
 
             size_t idx = min(50,int(vCosParallax.size()-1));

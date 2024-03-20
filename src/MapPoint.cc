@@ -105,6 +105,15 @@ MapPoint::MapPoint(const Eigen::Vector3f &Pos, Map* pMap, Frame* pFrame, const i
     const float levelScaleFactor =  pFrame->mvScaleFactors[level];
     const int nLevels = pFrame->mnScaleLevels;
 
+    /*
+    pyramid level: 0, 1, ..., m, ... , n-1. 0 是原图，每加一个level，图像缩小1.2倍
+    
+    假如kpt是在 level m 被观测到的；kpt在相机坐标系（相机level0坐标系）坐标为(x,y,z)，
+    
+    那么这个点距离相机多远，依然能被观测到呢？即相机后退到 当前虚拟相机level m的位置上 (x,y,z*1.2^m)
+
+    那么这个点距离相机多远，依然能被观测到呢？即虚拟相机level n-1 移动到 当前虚拟相机level m的位置 (x,y,z/1.2^{n-1-m})
+    */
     mfMaxDistance = dist*levelScaleFactor;
     mfMinDistance = mfMaxDistance/pFrame->mvScaleFactors[nLevels-1];
 
@@ -138,6 +147,11 @@ KeyFrame* MapPoint::GetReferenceKeyFrame()
     return mpRefKF;
 }
 
+/*
+先只关注 针孔 相机的情况，pKF -> NLeft == -1
+mObservations: map[pKF] -> {点在pKF的keypoints中的索引，第二个值没用}
+nObs是点的被观测次数，双目都观测到了，算两次
+*/
 void MapPoint::AddObservation(KeyFrame* pKF, int idx)
 {
     unique_lock<mutex> lock(mMutexFeatures);
@@ -238,6 +252,12 @@ void MapPoint::SetBadFlag()
     mpMap->EraseMapPoint(this);
 }
 
+/*
+somehow，同一个mappoint 在tracking过程中会被检成不同的ORB kpt，导致创建了多个mappoint obj
+在 ORBmatcher::Fuse 中会 将 mappoints投影到 keframe中，会把重复的mappoint obj融合成一个
+这样被融合的mappoint obj 的成员变量 mpReplaced 会被赋值。这样以来，后面Frame去取 被融合的mappoint obj时，就会换成 融合后的 mappoint obj
+被融合的mappoint obj 的成员变量 mbBad 会被赋成true
+*/
 MapPoint* MapPoint::GetReplaced()
 {
     unique_lock<mutex> lock1(mMutexFeatures);
@@ -284,6 +304,8 @@ void MapPoint::Replace(MapPoint* pMP)
         }
         else
         {
+            // 如果新的MP在之前MP对应的关键帧里面，就撞车了。
+            // 本来目的想新旧MP融为一个，这样以来一个点有可能对应两个特征点，这样是决不允许的，所以删除旧的，不动新的
             if(leftIndex != -1){
                 pKF->EraseMapPointMatch(leftIndex);
             }
@@ -528,6 +550,7 @@ int MapPoint::PredictScale(const float &currentDist, KeyFrame* pKF)
     return nScale;
 }
 
+// 预测 currentDist 应该在 level 几 被观测到
 int MapPoint::PredictScale(const float &currentDist, Frame* pF)
 {
     float ratio;

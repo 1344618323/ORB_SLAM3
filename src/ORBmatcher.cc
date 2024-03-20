@@ -40,6 +40,14 @@ namespace ORB_SLAM3
     {
     }
 
+    /*
+    for mp in vpMapPoints:
+        将mp投影到 F 中，在F相关区域内 找出所有 符合预期 level 的 Fkpts
+        for kpt in Fkpts:
+            如果kpt有右目观测，可以将 mp 投影到右目，若超过阈值，就pass
+            暴力找desp最近的 kpt，如果不满足非极大值抑制，就pass
+        mp 与 kpt 是一对一的，但不是二分图匹配那种
+    */
     int ORBmatcher::SearchByProjection(Frame &F, const vector<MapPoint*> &vpMapPoints, const float th, const bool bFarPoints, const float thFarPoints)
     {
         int nmatches=0, left = 0, right = 0;
@@ -214,16 +222,28 @@ namespace ORB_SLAM3
 
     float ORBmatcher::RadiusByViewingCos(const float &viewCos)
     {
+        // viewCos越大，差角越小，可容忍的偏差就越小
         if(viewCos>0.998)
             return 2.5;
         else
             return 4.0;
     }
 
+    /*
+    暴力搜索（但使用了词袋的加速）：
+    给定pKF desp（只考虑地图点！）, F desp
+    for d in PkF desp:
+        从  F desp 找出 与d1 最接近的 d2
+        p1 p2 实现配对（配对是1对1的，如果已经被配了，就不能再配了。不是二分图最优解）
+    
+    统计配对点的angle差。角度差按 HISTO_LENGTH（30度）分成360/30=12组。
+    统计每个区间内的数量，数量最多的三个视为合格。其他区间的匹配为误匹配。
+    */
     int ORBmatcher::SearchByBoW(KeyFrame* pKF,Frame &F, vector<MapPoint*> &vpMapPointMatches)
     {
         const vector<MapPoint*> vpMapPointsKF = pKF->GetMapPointMatches();
 
+        // 一对一匹配，不会一对多
         vpMapPointMatches = vector<MapPoint*>(F.N,static_cast<MapPoint*>(NULL));
 
         const DBoW2::FeatureVector &vFeatVecKF = pKF->mFeatVec;
@@ -243,6 +263,7 @@ namespace ORB_SLAM3
 
         while(KFit != KFend && Fit != Fend)
         {
+            // parentnode id 一致，即 des相似
             if(KFit->first == Fit->first)
             {
                 const vector<unsigned int> vIndicesKF = KFit->second;
@@ -273,6 +294,7 @@ namespace ORB_SLAM3
                     for(size_t iF=0; iF<vIndicesF.size(); iF++)
                     {
                         if(F.Nleft == -1){
+                            // 针孔会进这里
                             const unsigned int realIdxF = vIndicesF[iF];
 
                             if(vpMapPointMatches[realIdxF])
@@ -326,6 +348,7 @@ namespace ORB_SLAM3
 
                     if(bestDist1<=TH_LOW)
                     {
+                        // 非极大值抑制
                         if(static_cast<float>(bestDist1)<mfNNratio*static_cast<float>(bestDist2))
                         {
                             vpMapPointMatches[bestIdxF]=pMP;
@@ -354,6 +377,7 @@ namespace ORB_SLAM3
                             nmatches++;
                         }
 
+                        // 鱼眼才进这里
                         if(bestDist1R<=TH_LOW)
                         {
                             if(static_cast<float>(bestDist1R)<mfNNratio*static_cast<float>(bestDist2R) || true)
@@ -904,6 +928,13 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /*
+    pKF1、PKF2之间的位姿变换已知，通过对极约束，匹配pKF1、pKF2中还没有建成mappoint的特征点
+    匹配要求：
+    1. desp足够近
+    2. 粗搜 || 满足对极约束
+    3. orb orientation
+    */
     int ORBmatcher::SearchForTriangulation(KeyFrame *pKF1, KeyFrame *pKF2,
                                            vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse)
     {
@@ -915,8 +946,10 @@ namespace ORB_SLAM3
         Sophus::SE3f T2w = pKF2->GetPose();
         Sophus::SE3f Tw2 = pKF2->GetPoseInverse(); // for convenience
         Eigen::Vector3f Cw = pKF1->GetCameraCenter();
+        // t21
         Eigen::Vector3f C2 = T2w * Cw;
 
+        // kf1光心在kf2相机平面的投影，即极点
         Eigen::Vector2f ep = pKF2->mpCamera->project(C2);
         Sophus::SE3f T12;
         Sophus::SE3f Tll, Tlr, Trl, Trr;
@@ -962,6 +995,7 @@ namespace ORB_SLAM3
 
         while(f1it!=f1end && f2it!=f2end)
         {
+            // 同一 node下
             if(f1it->first == f2it->first)
             {
                 for(size_t i1=0, iend1=f1it->second.size(); i1<iend1; i1++)
@@ -1025,6 +1059,8 @@ namespace ORB_SLAM3
 
                         if(!bStereo1 && !bStereo2 && !pKF1->mpCamera2)
                         {
+                            // 两个都是单目特征点 且 是针孔相机 会进入这个条件； 若有特征点是双目的，就不会进到这里
+                            // sqrt(distex*distex+distey*distey)就是极线距离，若极线距离太小，就说明3D点距离相机太近，就滤掉
                             const float distex = ep(0)-kp2.pt.x;
                             const float distey = ep(1)-kp2.pt.y;
                             if(distex*distex+distey*distey<100*pKF2->mvScaleFactors[kp2.octave])
@@ -1071,6 +1107,7 @@ namespace ORB_SLAM3
 
                         if(bCoarse || pCamera1->epipolarConstrain(pCamera2,kp1,kp2,R12,t12,pKF1->mvLevelSigma2[kp1.octave],pKF2->mvLevelSigma2[kp2.octave])) // MODIFICATION_2
                         {
+                            // 粗搜 || 满足对极约束会进入这里
                             bestIdx2 = idx2;
                             bestDist = dist;
                         }

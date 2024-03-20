@@ -23,6 +23,7 @@
 namespace ORB_SLAM3
 {
 
+// 从R,t求F
 Eigen::Matrix3f GeometricTools::ComputeF12(KeyFrame* &pKF1, KeyFrame* &pKF2)
 {
     Sophus::SE3<float> Tc1w = pKF1->GetPose();
@@ -44,6 +45,7 @@ Eigen::Matrix3f GeometricTools::ComputeF12(KeyFrame* &pKF1, KeyFrame* &pKF2)
     return K1.transpose().inverse() * tc1c2x * Rc1c2 * K2.inverse();
 }
 
+// 三角化
 bool GeometricTools::Triangulate(Eigen::Vector3f &x_c1, Eigen::Vector3f &x_c2,Eigen::Matrix<float,3,4> &Tc1w ,Eigen::Matrix<float,3,4> &Tc2w , Eigen::Vector3f &x3D)
 {
     Eigen::Matrix4f A;

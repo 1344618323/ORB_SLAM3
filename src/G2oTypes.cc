@@ -632,8 +632,11 @@ void EdgeInertialGS::computeError()
     const Eigen::Vector3d dV = mpInt->GetDeltaVelocity(b).cast<double>();
     const Eigen::Vector3d dP = mpInt->GetDeltaPosition(b).cast<double>();
 
+    // er = \Delta R_{ij}^T R_i^T R_j
     const Eigen::Vector3d er = LogSO3(dR.transpose()*VP1->estimate().Rwb.transpose()*VP2->estimate().Rwb);
+    // ev = R_i^T(s*v_j - s*v_i - g t) - \Delta v_{ij}
     const Eigen::Vector3d ev = VP1->estimate().Rwb.transpose()*(s*(VV2->estimate() - VV1->estimate()) - g*dt) - dV;
+    // ep = R_i^T(s*p_j - s*p_i -s*v_i t - 0.5gt^2) - \Delta p_{ij}
     const Eigen::Vector3d ep = VP1->estimate().Rwb.transpose()*(s*(VP2->estimate().twb - VP1->estimate().twb - VV1->estimate()*dt) - g*dt*dt/2) - dP;
 
     _error << er, ev, ep;

@@ -57,6 +57,16 @@ void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopF
 }
 
 
+/*
+这个函数只在GlobalBundleAdjustemnt中调用
+ * @brief bundle adjustment 优化过程
+ * @param[in] vpKFs                 参与BA的所有关键帧
+ * @param[in] vpMP                  参与BA的所有地图点
+ * @param[in] nIterations           优化迭代次数
+ * @param[in] pbStopFlag            外部控制BA结束标志
+ * @param[in] nLoopKF               形成了闭环的当前关键帧的id
+ * @param[in] bRobust               是否使用核函数
+*/
 void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<MapPoint *> &vpMP,
                                  int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)
 {
@@ -122,6 +132,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
         Sophus::SE3<float> Tcw = pKF->GetPose();
         vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(),Tcw.translation().cast<double>()));
         vSE3->setId(pKF->mnId);
+        // 固定第一帧
         vSE3->setFixed(pKF->mnId==pMap->GetInitKFid());
         optimizer.addVertex(vSE3);
         if(pKF->mnId>maxKFid)
@@ -292,6 +303,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
         g2o::SE3Quat SE3quat = vSE3->estimate();
         if(nLoopKF==pMap->GetOriginKF()->mnId)
         {
+            // 只有CreateInitialMapMonocular里的GlobalBundleAdjustemnt才会跑到这里
             pKF->SetPose(Sophus::SE3f(SE3quat.rotation().cast<float>(), SE3quat.translation().cast<float>()));
         }
         else
@@ -299,6 +311,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
             pKF->mTcwGBA = Sophus::SE3d(SE3quat.rotation(),SE3quat.translation()).cast<float>();
             pKF->mnBAGlobalForKF = nLoopKF;
 
+            // 后面这一大串代码似乎没啥卵用？
             Sophus::SE3f mTwc = pKF->GetPoseInverse();
             Sophus::SE3f mTcGBA_c = pKF->mTcwGBA * mTwc;
             Eigen::Vector3f vector_dist =  mTcGBA_c.translation();
@@ -389,6 +402,33 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
     }
 }
 
+/*
+if bInit:
+    所有帧用同一bg,ba
+    目标设置为0，信息矩阵为priorG、priorA
+else:
+    所有帧用不同bg,ba
+    信息矩阵为预积分的信息矩阵
+
+InitializeIMU()一二阶段，bInit是true；InitializeIMU()三阶段 是false
+
+-----------------
+
+if bFixLocal:
+    固定新帧 以及 周边的一些帧
+else：
+    不固定
+
+在imu初始化时，bFixLocal都是false
+
+-----------------
+
+比较神奇的是，如果设置成 bFixLocal=false，就没有任何固定，全部要优化，这合理吗？
+
+-----------------
+
+edge: 预积分、bg、ba、重投影
+*/
 void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const long unsigned int nLoopId, bool *pbStopFlag, bool bInit, float priorG, float priorA, Eigen::VectorXd *vSingVal, bool *bHess)
 {
     long unsigned int maxKFid = pMap->GetMaxKFid();
@@ -441,6 +481,7 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
             optimizer.addVertex(VV);
             if (!bInit)
             {
+                // 每个kf有不同的bias
                 VertexGyroBias* VG = new VertexGyroBias(pKFi);
                 VG->setId(maxKFid+3*(pKFi->mnId)+2);
                 VG->setFixed(bFixed);
@@ -455,6 +496,7 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
 
     if (bInit)
     {
+        // 每个kf用相同的bias
         VertexGyroBias* VG = new VertexGyroBias(pIncKF);
         VG->setId(4*maxKFid+2);
         VG->setFixed(false);
@@ -539,6 +581,7 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
 
                 g2o::RobustKernelHuber* rki = new g2o::RobustKernelHuber;
                 ei->setRobustKernel(rki);
+                // 9个自由度
                 rki->setDelta(sqrt(16.92));
 
                 optimizer.addEdge(ei);
@@ -713,6 +756,8 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
 
         if(bAllFixed)
         {
+            // 只要有一帧kf是要优化的，那这个mappoint就要优化
+            // 如果没有一帧kf是要优化的，就移除这个mappoint（有个疑问？那重投影的edge还在吗？应该也被remove了吧）
             optimizer.removeVertex(vPoint);
             vbNotIncludedMP[i]=true;
         }
@@ -811,6 +856,24 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
 }
 
 
+/*
+PnP: pframe中存了Mappoint
+如果Mappoint是2D，就是普通的重投影误差
+如果Mappoint是3D，误差为：dx,dy,ddisparity （不是双重投影误差）
+
+误差的信息矩阵：获取ORB的分辨率越低，协方差越大；正常分辨率下，协方差为1
+
+值得一提的是里面的鲁棒核函数：使用了Huber。若 |y-f(x)| < delta 则为原来的二次项；若 |y-f(x)| > delta，就是一次项
+delta取值用的是卡方检测的阈值
+
+Mappoint是单目，delta=sqrt(5.9); Mappoint是双目，delta=sqrt(7.8)；即卡方检测认为是外点时，就使用鲁棒核函数
+
+优化4*10次；epoch=4，每次优化10下
+第0次epoch： 优化，设置卡方外点下次不优化
+第1次epoch： 优化，检测所有edge，卡方检测外点下次不优化；0epoch检出的外点，在此次变成了内点，则优化
+第2次epoch： 优化，检测所有edge，卡方检测外点下次不优化；0epoch检出的外点，在此次变成了内点，则优化；抹掉鲁棒核函数
+第3次epoch： 优化
+*/
 int Optimizer::PoseOptimization(Frame *pFrame)
 {
     g2o::SparseOptimizer optimizer;
@@ -876,6 +939,7 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
                     e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(0)));
                     e->setMeasurement(obs);
+                    // 分辨率越低，误差越大
                     const float invSigma2 = pFrame->mvInvLevelSigma2[kpUn.octave];
                     e->setInformation(Eigen::Matrix2d::Identity()*invSigma2);
 
@@ -1020,9 +1084,11 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
             if(pFrame->mvbOutlier[idx])
             {
+                // 这个地方很有趣，如果优化结束后是外点，就会重新计算卡方
                 e->computeError();
             }
 
+            // 也就是说无论上次优化有没有用到这个边，都会有卡方值（正常情况下，如果上次优化没用到，就不会有卡方值）
             const float chi2 = e->chi2();
 
             if(chi2>chi2Mono[it])
@@ -1037,6 +1103,7 @@ int Optimizer::PoseOptimization(Frame *pFrame)
                 e->setLevel(0);
             }
 
+            // 最后一次优化前，会取消鲁棒核函数
             if(it==2)
                 e->setRobustKernel(0);
         }
@@ -1113,6 +1180,11 @@ int Optimizer::PoseOptimization(Frame *pFrame)
     return nInitialCorrespondences-nBad;
 }
 
+/*
+找出pKF的共视帧lLocalKeyFrames（包括pKF），以及lLocalKeyFrames的mappoint，即
+找出能观测到lLocalMapPoints的其他帧lFixedCameras
+localBA优化的是 lLocalKeyFrames、lLocalMapPoints，固定lFixedCameras，只使用重投影误差
+*/
 void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges)
 {
     // Local KeyFrames: First Breath Search from Current Keyframe
@@ -2380,6 +2452,13 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
     return nIn;
 }
 
+/*
+bLarge: true 当前帧的内点足够多，则优化是希望收敛更快的高斯牛顿法，并少优化几次
+        false 当前帧的内点较少，则希望用收敛更慢但更鲁棒的梯度下降，并多优化几次
+bRecInit： true 处在InitializeIMU()前两阶段，给预积分边加鲁棒核函数；false，则不用加了
+
+优化变量：时序上用IMU边关联的kf 以及 用共视边关联的kf；会根据优化结果去除本分mappoint与kf的错误关联
+*/
 void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges, bool bLarge, bool bRecInit)
 {
     Map* pCurrentMap = pKF->GetMap();
@@ -2391,9 +2470,16 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         maxOpt=25;
         opt_it=4;
     }
+    // 如果跟踪效果好，就多优化几个帧
     const int Nd = std::min((int)pCurrentMap->KeyFramesInMap()-2,maxOpt);
     const unsigned long maxKFid = pKF->mnId;
 
+    /*
+    要分清三个变量：
+    vpOptimizableKFs: 用预积分关联的kf
+    lpOptVisKFs: 除vpOptimizableKFs以外的共视kf
+    lFixedKeyFrames 在更下面： vpOptimizableKFs 时间戳最前kf的前一帧要固定；能看到共视帧+当前帧的mappoint以外的kf
+    */
     vector<KeyFrame*> vpOptimizableKFs;
     const vector<KeyFrame*> vpNeighsKFs = pKF->GetVectorCovisibleKeyFrames();
     list<KeyFrame*> lpOptVisKFs;
@@ -2501,6 +2587,7 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
             break;
     }
 
+    // 没啥用的变量，估计是为了debug
     bool bNonFixed = (lFixedKeyFrames.size() == 0);
 
     // Setup optimizer
@@ -2510,6 +2597,9 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
 
     g2o::BlockSolverX * solver_ptr = new g2o::BlockSolverX(linearSolver);
 
+    // Levenberg算法：lambda越大，越接近梯度下降；lambda越小，越接近高斯牛顿
+    // 高斯牛顿比梯度下降 收敛更快，但后者更鲁棒
+    // 如果追踪效果好，就追求快速收敛，否则选择更鲁棒的方式
     if(bLarge)
     {
         g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
@@ -2694,6 +2784,7 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
 
     const unsigned long iniMPid = maxKFid*5;
 
+    // map[kfid]
     map<int,int> mVisEdges;
     for(int i=0;i<N;i++)
     {
@@ -2854,11 +2945,15 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
     {
         EdgeMono* e = vpEdgesMono[i];
         MapPoint* pMP = vpMapPointEdgeMono[i];
+        // pMP->mTrackDepth：pMP是在tracking中最后观测它的帧中的深度
         bool bClose = pMP->mTrackDepth<10.f;
 
         if(pMP->isBad())
             continue;
 
+        // 卡方又大，且是远点
+        // 卡方更大，且是近点
+        // 这个边可能有问题
         if((e->chi2()>chi2Mono2 && !bClose) || (e->chi2()>1.5f*chi2Mono2 && bClose) || !e->isDepthPositive())
         {
             KeyFrame* pKFi = vpEdgeKFMono[i];
@@ -3039,6 +3134,20 @@ Eigen::MatrixXd Optimizer::Marginalize(const Eigen::MatrixXd &H, const int &star
     return res;
 }
 
+/*
+用pMap中所有的kfs来作这个初始化
+求解变量：
+    s(双目时固定为1，单目时初值为1),
+    Rwg(有个大致的初值),
+    v_{0~k} kfs世界坐标系下的速度 （函数输入参数bFixedVel=true时固定，默认是false）
+    ba,bg: 假设所有关键帧的bias都是同一个值。初值为0
+
+已知 kfs的pose p_{0~k} 都是up-to-scale（即尺度未知），优化过程中固定
+
+bg/ba: 线性更新
+Rwg: 两个自由度，更新方程 x = x exp(u,v,0)
+s: 更新方程 s=s exp(ds) 从而保证s一直是正数
+*/
 void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &scale, Eigen::Vector3d &bg, Eigen::Vector3d &ba, bool bMono, Eigen::MatrixXd  &covInertial, bool bFixedVel, bool bGauss, float priorG, float priorA)
 {
     Verbose::PrintMess("inertial optimization", Verbose::VERBOSITY_NORMAL);
@@ -3213,6 +3322,7 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &sc
         if ((pKFi->GetGyroBias() - bg.cast<float>()).norm() > 0.01)
         {
             pKFi->SetNewBias(b);
+            // 变化大，就重新预积分
             if (pKFi->mpImuPreintegrated)
                 pKFi->mpImuPreintegrated->Reintegrate();
         }
@@ -3386,6 +3496,9 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Vector3d &bg, Eigen::Vect
     }
 }
 
+/*
+固定pose、vel、bias，优化g、s
+*/
 void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &scale)
 {
     int its = 10;
@@ -5280,6 +5393,7 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
             tot_out++;
     }
 
+    // P(cur, last) = p(cur|last)p(last)
     H = Marginalize(H,0,14);
 
     pFrame->mpcpi = new ConstraintPoseImu(VP->estimate().Rwb,VP->estimate().twb,VV->estimate(),VG->estimate(),VA->estimate(),H.block<15,15>(15,15));

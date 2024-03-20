@@ -103,6 +103,14 @@ void KeyFrame::ComputeBoW()
         // Feature vector associate features with nodes in the 4th level (from leaves up)
         // We assume the vocabulary tree has 6 levels, change the 4 otherwise
         mpORBvocabulary->transform(vCurrentDesc,mBowVec,mFeatVec,4);
+        /*
+        TF: number of word i in image/number of words in image    描述query中出现的次数
+        idf: log( nubmer of images / number of images containing word i ) 描述字典中出现的次数
+        word i score: TF*idf
+
+        mBowVec[word i id] = word i score
+        mFeaVec[level4 node id] = vector{query idx}
+        */
     }
 }
 
@@ -378,6 +386,8 @@ MapPoint* KeyFrame::GetMapPoint(const size_t &idx)
 
 void KeyFrame::UpdateConnections(bool upParent)
 {
+    // map[keyframe] -> keyframe观测到的this->mappoint数量
+    // 描述其他keyframe 与 this 的共视程度
     map<KeyFrame*,int> KFcounter;
 
     vector<MapPoint*> vpMP;
@@ -433,6 +443,7 @@ void KeyFrame::UpdateConnections(bool upParent)
             nmax=mit->second;
             pKFmax=mit->first;
         }
+        // 共视点超过15个才建立连接
         if(mit->second>=th)
         {
             vPairs.push_back(make_pair(mit->second,mit->first));
@@ -440,17 +451,20 @@ void KeyFrame::UpdateConnections(bool upParent)
         }
     }
 
+    // 极端情况下，没有一个keyframe与this有15个以上的共视点。此时就用有最多共视点的那个keyframe与this建立连接
     if(vPairs.empty())
     {
         vPairs.push_back(make_pair(nmax,pKFmax));
         pKFmax->AddConnection(this,nmax);
     }
 
+    // 共视点从少到多
     sort(vPairs.begin(),vPairs.end());
     list<KeyFrame*> lKFs;
     list<int> lWs;
     for(size_t i=0; i<vPairs.size();i++)
     {
+        // 注意这个傻逼代码，push_front！变成了从多到少
         lKFs.push_front(vPairs[i].second);
         lWs.push_front(vPairs[i].first);
     }
@@ -463,8 +477,10 @@ void KeyFrame::UpdateConnections(bool upParent)
         mvOrderedWeights = vector<int>(lWs.begin(), lWs.end());
 
 
+        // mnId!=mpMap->GetInitKFid() 作用：比如map的第一个关键帧是this，那么this就不应该有parent
         if(mbFirstConnection && mnId!=mpMap->GetInitKFid())
         {
+            // 第一次建立连接时，将共视点最多的那个keyframe作为parent
             mpParent = mvpOrderedConnectedKeyFrames.front();
             mpParent->AddChild(this);
             mbFirstConnection = false;

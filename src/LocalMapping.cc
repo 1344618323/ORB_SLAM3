@@ -61,6 +61,59 @@ void LocalMapping::SetTracker(Tracking *pTracker)
     mpTracker=pTracker;
 }
 
+/*
+1. ProcessNewKeyFrame() 
+    1. 更新新kf与mappoint的关联；更新mappoint观测方向向量、描述符
+    2. 更新新kf的共视帧
+    3. map插入新kf
+    4. 搜集新kf(stereo)带入的新mappoint
+
+2. MapPointCulling()
+    ORB3中对最新三帧才创建的mappoint持怀疑态度
+    会根据 实观测数/应观测数 来滤除一些outlier
+
+3. CreateNewMapPoints()
+    前言：在tracking stereo中会创建一些近距离的mappoint
+    而在这个函数中，会基于对极约束投影，寻找新的非mappoint的kpts匹配，从而实现 双图像 三角化。
+    对于双目而言，会根据视差：对极视差大，就用前后帧；双目视差大，就用双目
+
+4. SearchInNeighbors()
+    这一步也是对mappoint做处理
+    整理出当前帧的所有共视帧的mappoints
+    for mp in mappoints:
+        proj(curkf, mp)
+        找出curkf中与mp相似的mappoints，并融合成一个
+
+5. BA
+    if imu初始化了：
+        LocalInertialBA // 预积分+BA误差 优化帧+mappoint，并去错误的frame与mappoint关联
+    else：
+        LocalBundleAdjustment // BA误差 优化当前帧及其共视帧，及这些帧都看到的mappoint，并去错误的frame与mappoint关联
+
+    if 配置了IMU && imu还没初始化：
+        InitializeIMU() 阶段一：全局使用同一ba、bg，且低方差
+        符合了特定条件，设置imu初始化了
+
+    KeyFrameCulling() 搜集当前帧的共视帧，并遍历：若某一帧 能看到的mappoint 有90% 在其他三帧中的更高分辨率层中被观测到了，就剔除
+
+    if 系统运行前50s && imu初始化了:
+        if 没执行了阶段二 且 系统运行至少5s:
+            InitializeIMU() 阶段二：全局使用同一ba、bg，且高方差
+        elif 系统运行至少15s 且 执行了 阶段二 且 没执行阶段三:
+            InitializeIMU() 阶段三：
+        if 关键帧数量不到200：
+            ScaleRefinement() // 这个任务会执行几次
+
+    ------------------------------------------------
+            说明下 InitializeIMU()：
+                InertialOptimization() 预积分误差，固定相机pose，优化vel/bias/s/g 论文中figure 2(c)
+                FullInertialBA() 预积分+BA误差 优化 pose/vel/bias/mappoints
+
+            说明下 ScaleRefinement()：预积分误差，固定其他，优化s/g 论文中figure 2(d)
+    ------------------------------------------------
+
+6. loopclosure加入关键帧
+*/
 void LocalMapping::Run()
 {
     mbFinished = false;
@@ -80,6 +133,7 @@ void LocalMapping::Run()
             std::chrono::steady_clock::time_point time_StartProcessKF = std::chrono::steady_clock::now();
 #endif
             // BoW conversion and insertion in Map
+            // 用新kf更新Covisibility Graph；并将新kf加入map
             ProcessNewKeyFrame();
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_EndProcessKF = std::chrono::steady_clock::now();
@@ -89,6 +143,7 @@ void LocalMapping::Run()
 #endif
 
             // Check recent MapPoints
+            // 对最近3帧内产生的mappoint做cull处理
             MapPointCulling();
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_EndMPCulling = std::chrono::steady_clock::now();
@@ -104,6 +159,7 @@ void LocalMapping::Run()
 
             if(!CheckNewKeyFrames())
             {
+                // 这个比较耗时，所以要先通过这个if检测下有没有新关键帧，若没有，就继续
                 // Find more matches in neighbor keyframes and fuse point duplications
                 SearchInNeighbors();
             }
@@ -131,12 +187,17 @@ void LocalMapping::Run()
                         float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
                                 (mpCurrentKeyFrame->mPrevKF->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->mPrevKF->GetCameraCenter()).norm();
 
+                        /*
+                        Tinit 用于记录系统运行时间
+                        三帧距离足够远才算入计时
+                        */
                         if(dist>0.05)
                             mTinit += mpCurrentKeyFrame->mTimeStamp - mpCurrentKeyFrame->mPrevKF->mTimeStamp;
                         if(!mpCurrentKeyFrame->GetMap()->GetIniertialBA2())
                         {
                             if((mTinit<10.f) && (dist<0.02))
                             {
+                                // 系统运行时间又短，距离又短，就认为imu没有重复激励，重启
                                 cout << "Not enough motion for initializing. Reseting..." << endl;
                                 unique_lock<mutex> lock(mMutexReset);
                                 mbResetRequestedActiveMap = true;
@@ -197,6 +258,7 @@ void LocalMapping::Run()
                 vdKFCulling_ms.push_back(timeKFCulling_ms);
 #endif
 
+                // 系统前50s，都会Init IMU
                 if ((mTinit<50.0f) && mbInertial)
                 {
                     if(mpCurrentKeyFrame->GetMap()->isImuInitialized() && mpTracker->mState==Tracking::OK) // Enter here everytime local-mapping is called
@@ -295,6 +357,12 @@ bool LocalMapping::CheckNewKeyFrames()
     return(!mlNewKeyFrames.empty());
 }
 
+/*
+1. 更新新kf与mappoint的关联；更新mappoint观测方向向量、描述符
+2. 更新新kf的共视帧
+3. map插入新kf
+4. 搜集新kf(stereo)带入的新mappoint
+*/
 void LocalMapping::ProcessNewKeyFrame()
 {
     {
@@ -316,6 +384,11 @@ void LocalMapping::ProcessNewKeyFrame()
         {
             if(!pMP->isBad())
             {
+                /*
+                这段代码我觉得是真坑。
+                除初始化以及双目帧新观测的mappoint以外，创建keyframe时，不会关联mappoint与keyframe。
+                所以会进入下面的if语句
+                */ 
                 if(!pMP->IsInKeyFrame(mpCurrentKeyFrame))
                 {
                     pMP->AddObservation(mpCurrentKeyFrame, i);
@@ -324,6 +397,9 @@ void LocalMapping::ProcessNewKeyFrame()
                 }
                 else // this can only happen for new stereo points inserted by the Tracking
                 {
+                    // else后边那个注释不全：单/双目初始化以及双目帧新观测的mappoint 都会进入这里
+                    // 顺带一提： 在LocalMapping::CreateNewMapPoints()也会对这个成员变量做push_back操作
+                    // 所以，这个成员变量用于记录最新加入的mappoint
                     mlpRecentAddedMapPoints.push_back(pMP);
                 }
             }
@@ -343,6 +419,7 @@ void LocalMapping::EmptyQueue()
         ProcessNewKeyFrame();
 }
 
+// 对最近产生mappoint做culling处理
 void LocalMapping::MapPointCulling()
 {
     // Check Recent Added MapPoints
@@ -366,15 +443,18 @@ void LocalMapping::MapPointCulling()
             lit = mlpRecentAddedMapPoints.erase(lit);
         else if(pMP->GetFoundRatio()<0.25f)
         {
+            // 可见率太低，删除
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else if(((int)nCurrentKFid-(int)pMP->mnFirstKFid)>=2 && pMP->Observations()<=cnThObs)
         {
+            // 这个mappoint是2帧前创建的，但被观测测次数太少，就删除
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else if(((int)nCurrentKFid-(int)pMP->mnFirstKFid)>=3)
+            // 这个mappoint是3帧前创建的，就不再算是最近观测帧了
             lit = mlpRecentAddedMapPoints.erase(lit);
         else
         {
@@ -385,6 +465,19 @@ void LocalMapping::MapPointCulling()
 }
 
 
+/*
+创建新的mappoint
+其实，在Tracking::CreateNewKeyFrame() 对双目就已经创建了部分 短深度的mappoint
+在这个函数中：
+1. 对于单目：
+    遍历共视帧：
+        match 共视帧 和 当前帧 满足对极约束，且不是mappoitn的kpts
+        三角化
+2. 对于双目：
+    遍历共视帧：
+        match 共视帧 和 当前帧 满足对极约束，且不是mappoint的kpts
+        从双目、前后帧对极 中 找到视差最大的那个 去三角化
+*/
 void LocalMapping::CreateNewMapPoints()
 {
     // Retrieve neighbor keyframes in covisibility graph
@@ -396,6 +489,7 @@ void LocalMapping::CreateNewMapPoints()
 
     if (mbInertial)
     {
+        // 使用IMU时，将vpNeighKFs凑到nn个
         KeyFrame* pKF = mpCurrentKeyFrame;
         int count=0;
         while((vpNeighKFs.size()<=nn)&&(pKF->mPrevKF)&&(count++<nn))
@@ -433,6 +527,7 @@ void LocalMapping::CreateNewMapPoints()
     // Search matches with epipolar restriction and triangulate
     for(size_t i=0; i<vpNeighKFs.size(); i++)
     {
+        // 下面的过程比较耗时，如果前端有新kf，就return
         if(i>0 && CheckNewKeyFrames())
             return;
 
@@ -447,6 +542,7 @@ void LocalMapping::CreateNewMapPoints()
 
         if(!mbMonocular)
         {
+            // 对于双目而言，基线太短时，对极几何的三角化还不如双目的三角化
             if(baseline<pKF2->mb)
                 continue;
         }
@@ -455,6 +551,7 @@ void LocalMapping::CreateNewMapPoints()
             const float medianDepthKF2 = pKF2->ComputeSceneMedianDepth(2);
             const float ratioBaselineDepth = baseline/medianDepthKF2;
 
+            // 对于单目，如果共视帧中mappoint的平均深度太大，相对而言，基线就太短，三角化精度就不会高
             if(ratioBaselineDepth<0.01)
                 continue;
         }
@@ -463,6 +560,7 @@ void LocalMapping::CreateNewMapPoints()
         vector<pair<size_t,size_t> > vMatchedIndices;
         bool bCoarse = mbInertial && mpTracker->mState==Tracking::RECENTLY_LOST && mpCurrentKeyFrame->GetMap()->GetIniertialBA2();
 
+        // 给当前帧 与 共视帧 添加新的匹配点
         matcher.SearchForTriangulation(mpCurrentKeyFrame,pKF2,vMatchedIndices,false,bCoarse);
 
         Sophus::SE3<float> sophTcw2 = pKF2->GetPose();
@@ -568,6 +666,7 @@ void LocalMapping::CreateNewMapPoints()
 
             if(bStereo1)
                 cosParallaxStereo1 = cos(2*atan2(mpCurrentKeyFrame->mb/2,mpCurrentKeyFrame->mvDepth[idx1]));
+            // 我在想这是不是个bug，不应该有这个else
             else if(bStereo2)
                 cosParallaxStereo2 = cos(2*atan2(pKF2->mb/2,pKF2->mvDepth[idx2]));
 
@@ -582,12 +681,14 @@ void LocalMapping::CreateNewMapPoints()
             if(cosParallaxRays<cosParallaxStereo && cosParallaxRays>0 && (bStereo1 || bStereo2 ||
                                                                           (cosParallaxRays<0.9996 && mbInertial) || (cosParallaxRays<0.9998 && !mbInertial)))
             {
+                // 对极 视差大，三角化更准
                 goodProj = GeometricTools::Triangulate(xn1, xn2, eigTcw1, eigTcw2, x3D);
                 if(!goodProj)
                     continue;
             }
             else if(bStereo1 && cosParallaxStereo1<cosParallaxStereo2)
             {
+                // 双目 视差大，三角化更准
                 countStereoAttempt++;
                 bPointStereo = true;
                 goodProj = mpCurrentKeyFrame->UnprojectStereo(idx1, x3D);
@@ -711,6 +812,9 @@ void LocalMapping::CreateNewMapPoints()
     }    
 }
 
+/*
+融合当前关键帧与相邻帧（两级相邻）重复的MapPoints
+*/
 void LocalMapping::SearchInNeighbors()
 {
     // Retrieve neighbor keyframes
@@ -991,6 +1095,7 @@ void LocalMapping::KeyFrameCulling()
                                 }
                             }
 
+                            // scale小（高分辨率图像）时，orb kpts精度更高，所以优先删除scale高的frame
                             if(scaleLeveli<=scaleLevel+1)
                             {
                                 nObs++;
@@ -1170,6 +1275,20 @@ bool LocalMapping::isFinished()
     return mbFinished;
 }
 
+/*
+InitializeIMU 有以下几步：
+1. InertialOptimization: 
+    if InitializeIMU 一阶段：
+        会根据历史加速度估计一个g；并估计出各个帧v的初值；
+        至于s的初值，双目会固定为1，优化中fix；而单目的s会以1为初值
+    固定历史帧的cam pose，优化变量： 所有帧的v、s、Rwg 、bias(所有帧公用一个)
+2. 更新所有帧的pose、v、bias
+3. FullInertialBA:
+    优化所有帧的pose、vel、bias，所有mappoints
+    其中 InitializeIMU 一阶段、二阶段： bias共有一个，但一阶段bias设置方差小，二阶段bais设置方差大
+        InitializeIMU 三阶段： InertialOptimization依然是公用一个bias，但在FullInertialBA中各帧有各自的bias
+4. 更新所有帧的pose、v、bais, mappoint
+*/
 void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 {
     if (mbResetRequested)
@@ -1193,6 +1312,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
         return;
 
     // Retrieve all keyframe in temporal order
+    // 遍历拿到所有历史kf
     list<KeyFrame*> lpKF;
     KeyFrame* pKF = mpCurrentKeyFrame;
     while(pKF->mPrevKF)
@@ -1228,6 +1348,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
         Eigen::Matrix3f Rwg;
         Eigen::Vector3f dirG;
         dirG.setZero();
+        // 从头到尾开始遍历
         for(vector<KeyFrame*>::iterator itKF = vpKF.begin(); itKF!=vpKF.end(); itKF++)
         {
             if (!(*itKF)->mpImuPreintegrated)
@@ -1235,12 +1356,15 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
             if (!(*itKF)->mPrevKF)
                 continue;
 
+            // R_i * \Delta v_{ij}
             dirG -= (*itKF)->mPrevKF->GetImuRotation() * (*itKF)->mpImuPreintegrated->GetUpdatedDeltaVelocity();
+            // (p_j - p_i)/ Delta t_{ij}
             Eigen::Vector3f _vel = ((*itKF)->GetImuPosition() - (*itKF)->mPrevKF->GetImuPosition())/(*itKF)->mpImuPreintegrated->dT;
             (*itKF)->SetVelocity(_vel);
             (*itKF)->mPrevKF->SetVelocity(_vel);
         }
 
+        // 大致求一个 g 的方向向量
         dirG = dirG/dirG.norm();
         Eigen::Vector3f gI(0.0f, 0.0f, -1.0f);
         Eigen::Vector3f v = gI.cross(dirG);
@@ -1248,6 +1372,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
         const float cosg = gI.dot(dirG);
         const float ang = acos(cosg);
         Eigen::Vector3f vzg = v*ang/nv;
+        // 有： g = Rwg[0,0,1]
         Rwg = Sophus::SO3f::exp(vzg).matrix();
         mRwg = Rwg.cast<double>();
         mTinit = mpCurrentKeyFrame->mTimeStamp-mFirstTs;
@@ -1261,9 +1386,11 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 
     mScale=1.0;
 
+    // 这个成员变量没啥实质作用
     mInitTime = mpTracker->mLastFrame.mTimeStamp-vpKF.front()->mTimeStamp;
 
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    // 固定所有历史帧的相机位姿 pc_{0~k}，优化bg,ba（假设0~k的bias相同）,s,g,v_{0~k}
     Optimizer::InertialOptimization(mpAtlas->GetCurrentMap(), mRwg, mScale, mbg, mba, mbMonocular, infoInertial, false, false, priorG, priorA);
 
     std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
@@ -1303,6 +1430,11 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     std::chrono::steady_clock::time_point t4 = std::chrono::steady_clock::now();
     if (bFIBA)
     {
+        /*
+        1. 如果进if，则所有帧使用同一bias；如果进else，则所有帧使用不同bias。
+        2. 第三个参数是false： 会优化所有kf pose、v，mappoint；bias。
+            让我困惑的是，如此一来，没有任何一个顶点是固定的了
+        */ 
         if (priorA!=0.f)
             Optimizer::FullInertialBA(mpAtlas->GetCurrentMap(), 100, false, mpCurrentKeyFrame->mnId, NULL, true, priorG, priorA);
         else

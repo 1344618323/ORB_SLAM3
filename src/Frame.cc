@@ -98,6 +98,12 @@ Frame::Frame(const Frame &frame)
 }
 
 
+/*
+构建一个双针孔相机帧：
+1. 双线程提双目ORB
+2. 双目match求深度
+3. 将左目kpts分到64*48的cell里
+*/
 Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeStamp, ORBextractor* extractorLeft, ORBextractor* extractorRight, ORBVocabulary* voc, cv::Mat &K, cv::Mat &distCoef, const float &bf, const float &thDepth, GeometricCamera* pCamera, Frame* pPrevF, const IMU::Calib &ImuCalib)
     :mpcpi(NULL), mpORBvocabulary(voc),mpORBextractorLeft(extractorLeft),mpORBextractorRight(extractorRight), mTimeStamp(timeStamp), mK(K.clone()), mK_(Converter::toMatrix3f(K)), mDistCoef(distCoef.clone()), mbf(bf), mThDepth(thDepth),
      mImuCalib(ImuCalib), mpImuPreintegrated(NULL), mpPrevFrame(pPrevF),mpImuPreintegratedFrame(NULL), mpReferenceKF(static_cast<KeyFrame*>(NULL)), mbIsSet(false), mbImuPreintegrated(false),
@@ -384,6 +390,10 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp, ORBextractor* extra
 
 void Frame::AssignFeaturesToGrid()
 {
+    /*
+    双针孔相机进入这里时，N为左目kpt总数，Nleft=-1
+    将图像分成FRAME_GRID_COLS*FRAME_GRID_ROWS(64*48)个cells
+    */
     // Fill matrix with points
     const int nCells = FRAME_GRID_COLS*FRAME_GRID_ROWS;
 
@@ -553,6 +563,7 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
 
         const float viewCos = PO.dot(Pn)/dist;
 
+        // 比如viewingCosLimit=0.5，那差角不能超过60度
         if(viewCos<viewingCosLimit)
             return false;
 
@@ -654,6 +665,9 @@ Eigen::Vector3f Frame::inRefCoordinates(Eigen::Vector3f pCw)
     return mRcw * pCw + mtcw;
 }
 
+/*
+搜索x,y，r范围内 level在 minlevel，maxlevel内的所有特征点
+*/
 vector<size_t> Frame::GetFeaturesInArea(const float &x, const float  &y, const float  &r, const int minLevel, const int maxLevel, const bool bRight) const
 {
     vector<size_t> vIndices;
@@ -790,7 +804,12 @@ void Frame::ComputeImageBounds(const cv::Mat &imLeft)
         mat.at<float>(3,0)=imLeft.cols; mat.at<float>(3,1)=imLeft.rows;
 
         mat=mat.reshape(2);
+
+        // [0,0], [cols,0], [0, rows], [cols, rows]
+        // 经过下面这个函数后
+        // 得到去畸变后的像素坐标
         cv::undistortPoints(mat,mat,static_cast<Pinhole*>(mpCamera)->toK(),mDistCoef,cv::Mat(),mK);
+        
         mat=mat.reshape(1);
 
         // Undistort corners
@@ -808,6 +827,15 @@ void Frame::ComputeImageBounds(const cv::Mat &imLeft)
     }
 }
 
+/*
+匹配左右目的orb kpt（所有kpt的坐标都是原图像像素坐标系下的）
+1. orb kpt是不同level的金字塔提取的，左右目匹配点所属于的level最多差1
+2. 先是像素级的平行线搜索：左目的kpt，会延着平行线上下的几个row（右目kpt的level越高，意味着所属金字塔的分辨率越低，那么左目要扫的row就越多），找desp最接近的那个右目kpt。代码中先建了一个vRowIndices用于加速搜索
+3. 此时得到了一对匹配的左右目整数像素坐标，但v坐标并不一致：SAD块匹配，l_kpt在其所属金字塔的10*10块；同一层，右目(r_kpt.u +- delta, l_kpt.v)的块；算出最优的块。
+    此时，v坐标已经一致，右目匹配点的u也已知，为了精度，我们希望将u优化到亚像素级
+4. 基于二次曲线求亚像素： 给定三点(u-1,d1),(u,d2),(u+1,d3)。d是SAD算出的分。在u-1到u+1之间算出最优的浮点u'，并投回原像素坐标
+5. 求深度
+*/
 void Frame::ComputeStereoMatches()
 {
     mvuRight = vector<float>(N,-1.0f);
@@ -818,6 +846,8 @@ void Frame::ComputeStereoMatches()
     const int nRows = mpORBextractorLeft->mvImagePyramid[0].rows;
 
     //Assign keypoints to row table
+    // vRowIndices.size()=原图 rowsize
+    // vRowIndices[i] 左图第i行的 极线搜索时 要搜索的 rightkpts的idx
     vector<vector<size_t> > vRowIndices(nRows,vector<size_t>());
 
     for(int i=0; i<nRows; i++)
@@ -829,6 +859,11 @@ void Frame::ComputeStereoMatches()
     {
         const cv::KeyPoint &kp = mvKeysRight[iR];
         const float &kpY = kp.pt.y;
+        /*
+        在进入这个函数前，ORB kpts是从各层金字塔中extract，并将其恢复到了原尺寸（上采样），
+        极线搜索会在kpts的row(+-2)上搜索
+        但考虑到上采样，会有不准，所有特意搞了个 r 的增幅
+        */ 
         const float r = 2.0f*mvScaleFactors[mvKeysRight[iR].octave];
         const int maxr = ceil(kpY+r);
         const int minr = floor(kpY-r);
@@ -839,13 +874,18 @@ void Frame::ComputeStereoMatches()
 
     // Set limits for search
     const float minZ = mb;
+    // 最小的视差就是0了，无穷远点
     const float minD = 0;
+    // 取最小的Z 为基线大小（经验值？），此时会有一个最大的视差maxD
     const float maxD = mbf/minZ;
 
     // For each left keypoint search a match in the right image
     vector<pair<int, int> > vDistIdx;
     vDistIdx.reserve(N);
 
+    /*
+    N,mvKeys 都是指左目的kpts
+    */
     for(int iL=0; iL<N; iL++)
     {
         const cv::KeyPoint &kpL = mvKeys[iL];
@@ -875,6 +915,7 @@ void Frame::ComputeStereoMatches()
             const size_t iR = vCandidates[iC];
             const cv::KeyPoint &kpR = mvKeysRight[iR];
 
+            // 要是左右目kpt的金字塔层超过1，就不要匹配
             if(kpR.octave<levelL-1 || kpR.octave>levelL+1)
                 continue;
 
@@ -897,6 +938,7 @@ void Frame::ComputeStereoMatches()
         if(bestDist<thOrbDist)
         {
             // coordinates in image pyramid at keypoint scale
+            // 绕这么一圈是因为：抽出的左右kpt不一定源自同一层金字塔层，以左为准
             const float uR0 = mvKeysRight[bestIdxR].pt.x;
             const float scaleFactor = mvInvScaleFactors[kpL.octave];
             const float scaleduL = round(kpL.pt.x*scaleFactor);
@@ -918,6 +960,7 @@ void Frame::ComputeStereoMatches()
             if(iniu<0 || endu >= mpORBextractorRight->mvImagePyramid[kpL.octave].cols)
                 continue;
 
+            // 行是相同行，列有个+-5的搜索区间。10*10的块相似度匹配
             for(int incR=-L; incR<=+L; incR++)
             {
                 cv::Mat IR = mpORBextractorRight->mvImagePyramid[kpL.octave].rowRange(scaledvL-w,scaledvL+w+1).colRange(scaleduR0+incR-w,scaleduR0+incR+w+1);
@@ -936,6 +979,7 @@ void Frame::ComputeStereoMatches()
                 continue;
 
             // Sub-pixel match (Parabola fitting)
+            // 给三穿越点，使用范德蒙矩阵求解二项式，求二项式的极值点
             const float dist1 = vDists[L+bestincR-1];
             const float dist2 = vDists[L+bestincR];
             const float dist3 = vDists[L+bestincR+1];
@@ -964,6 +1008,7 @@ void Frame::ComputeStereoMatches()
         }
     }
 
+    // 按SAD的分数排序，根据中值做滤波
     sort(vDistIdx.begin(),vDistIdx.end());
     const float median = vDistIdx[vDistIdx.size()/2].first;
     const float thDist = 1.5f*1.4f*median;
@@ -1004,6 +1049,7 @@ void Frame::ComputeStereoFromRGBD(const cv::Mat &imDepth)
     }
 }
 
+// return Twc*p[i]
 bool Frame::UnprojectStereo(const int &i, Eigen::Vector3f &x3D)
 {
     const float z = mvDepth[i];
@@ -1031,6 +1077,9 @@ void Frame::setIntegrated()
     mbImuPreintegrated = true;
 }
 
+/*
+给鱼眼相机用的，先绕路
+*/
 Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeStamp, ORBextractor* extractorLeft, ORBextractor* extractorRight, ORBVocabulary* voc, cv::Mat &K, cv::Mat &distCoef, const float &bf, const float &thDepth, GeometricCamera* pCamera, GeometricCamera* pCamera2, Sophus::SE3f& Tlr,Frame* pPrevF, const IMU::Calib &ImuCalib)
         :mpcpi(NULL), mpORBvocabulary(voc),mpORBextractorLeft(extractorLeft),mpORBextractorRight(extractorRight), mTimeStamp(timeStamp), mK(K.clone()), mK_(Converter::toMatrix3f(K)),  mDistCoef(distCoef.clone()), mbf(bf), mThDepth(thDepth),
          mImuCalib(ImuCalib), mpImuPreintegrated(NULL), mpPrevFrame(pPrevF),mpImuPreintegratedFrame(NULL), mpReferenceKF(static_cast<KeyFrame*>(NULL)), mbImuPreintegrated(false), mpCamera(pCamera), mpCamera2(pCamera2),

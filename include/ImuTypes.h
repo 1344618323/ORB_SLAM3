@@ -119,13 +119,16 @@ public:
 
 public:
     // Sophus/Eigen implementation
+    // 与imu外参
     Sophus::SE3<float> mTcb;
     Sophus::SE3<float> mTbc;
+    // cov(g, a); cov(bg, ba)
     Eigen::DiagonalMatrix<float,6> Cov, CovWalk;
     bool mbIsSet;
 };
 
 //Integration of 1 gyro measurement
+// 输入 w,bg,dt，获得积分后的 dR及对应的J_r(dR)
 class IntegratedRotation
 {
 public:
@@ -177,15 +180,21 @@ public:
     void CopyFrom(Preintegrated* pImuPre);
     void Initialize(const Bias &b_);
     void IntegrateNewMeasurement(const Eigen::Vector3f &acceleration, const Eigen::Vector3f &angVel, const float &dt);
+    // 设置bg、ba，重新预积分
     void Reintegrate();
+    // 合并前一帧的预积分，使用的bias是当前帧的
     void MergePrevious(Preintegrated* pPrev);
     void SetNewBias(const Bias &bu_);
     IMU::Bias GetDeltaBias(const Bias &b_);
 
+    // 输入b_, 使用雅可比获得预积分结果
     Eigen::Matrix3f GetDeltaRotation(const Bias &b_);
     Eigen::Vector3f GetDeltaVelocity(const Bias &b_);
     Eigen::Vector3f GetDeltaPosition(const Bias &b_);
 
+    // 代码傻逼的地方： 成员变量中有个b 计算预积分观测时用的bias；还有个bu，是一个更新的后的bias
+    // 下面三个函数获得的结果为 L(bu-b)的预积分结果
+    // 下面4到6是 原来用b计算的预积分
     Eigen::Matrix3f GetUpdatedDeltaRotation();
     Eigen::Vector3f GetUpdatedDeltaVelocity();
     Eigen::Vector3f GetUpdatedDeltaPosition();
@@ -209,6 +218,7 @@ public:
 
 public:
     float dT;
+    // 预积分协方差： [\theta, v, p, bg, ba]
     Eigen::Matrix<float,15,15> C;
     Eigen::Matrix<float,15,15> Info;
     Eigen::DiagonalMatrix<float,6> Nga, NgaWalk;
@@ -217,7 +227,9 @@ public:
     Bias b;
     Eigen::Matrix3f dR;
     Eigen::Vector3f dV, dP;
+    // 雅可比：dR/dbg, dV/dbg, ...
     Eigen::Matrix3f JRg, JVg, JVa, JPg, JPa;
+    // 预积分期间 平均 acc、w
     Eigen::Vector3f avgA, avgW;
 
 

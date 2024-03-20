@@ -41,6 +41,26 @@ class KeyFrame;
 class Map;
 class Frame;
 
+/*
+对象中的每个数据都有mutex来保证多线程读写时不会有数据竞争的情况。这些成员在加入新keyframe时都会进行更新
+
+重要成员：
+ 
+Eigen::Vector3f mWorldPos;
+
+// Keyframes observing the point and associated index in keyframe
+std::map<KeyFrame*,std::tuple<int,int> > mObservations;
+
+// Mean viewing direction，对于针孔相机，只统计左目
+Eigen::Vector3f mNormalVector;
+
+// 应该可见;确实见到了
+int mnVisible;
+int mnFound;
+
+// Best descriptor to fast matching
+cv::Mat mDescriptor;
+*/
 class MapPoint
 {
 
@@ -122,6 +142,9 @@ public:
     std::map<KeyFrame*,std::tuple<int,int>> GetObservations();
     int Observations();
 
+    /*
+    添加该mappoint被pKF观测到了
+    */
     void AddObservation(KeyFrame* pKF,int idx);
     void EraseObservation(KeyFrame* pKF);
 
@@ -141,10 +164,19 @@ public:
         return mnFound;
     }
 
+    /*
+    一个mappoint会被多个keyframe观测到，每个keyframe对这个mappoint自己的desp
+    这个函数的作用是融合这些desp
+    做法很简单，就是从这些desp中找一个到其他desp距离最小的那个
+    */
     void ComputeDistinctiveDescriptors();
 
     cv::Mat GetDescriptor();
 
+    /*
+    与ComputeDistinctiveDescriptors一样，一个mappoint会被多个keyframe观测到
+    统计 该mappoint到 各个观测到它的 keyframe的方向向量，取均值
+    */
     void UpdateNormalAndDepth();
 
     float GetMinDistanceInvariance();
@@ -165,6 +197,8 @@ public:
     static long unsigned int nNextId;
     long int mnFirstKFid;
     long int mnFirstFrame;
+    
+    // 双目看到+2，单目看到+1
     int nObs;
 
     // Variables used by the tracking
@@ -219,6 +253,7 @@ protected:
      std::map<long unsigned int, int> mBackupObservationsId2;
 
      // Mean viewing direction
+     // 对于针孔相机，只统计左目
      Eigen::Vector3f mNormalVector;
 
      // Best descriptor to fast matching
@@ -229,7 +264,9 @@ protected:
      long unsigned int mBackupRefKFId;
 
      // Tracking counters
+     // 应该可见
      int mnVisible;
+     // 确实见到了
      int mnFound;
 
      // Bad flag (we do not currently erase MapPoint from memory)

@@ -411,7 +411,9 @@ namespace ORB_SLAM3
             nfeatures(_nfeatures), scaleFactor(_scaleFactor), nlevels(_nlevels),
             iniThFAST(_iniThFAST), minThFAST(_minThFAST)
     {
+        // 1, 1.2, 1.44, ...
         mvScaleFactor.resize(nlevels);
+        // 1, 1.2*1.2, 1.44*1.44, ...
         mvLevelSigma2.resize(nlevels);
         mvScaleFactor[0]=1.0f;
         mvLevelSigma2[0]=1.0f;
@@ -431,6 +433,7 @@ namespace ORB_SLAM3
 
         mvImagePyramid.resize(nlevels);
 
+        // 将 nfeatures 按缩方比例 分配 （为啥不是比例的平方呢？）
         mnFeaturesPerLevel.resize(nlevels);
         float factor = 1.0f / scaleFactor;
         float nDesiredFeaturesPerScale = nfeatures*(1 - factor)/(1 - (float)pow((double)factor, (double)nlevels));
@@ -450,6 +453,10 @@ namespace ORB_SLAM3
 
         //This is for orientation
         // pre-compute the end of a row in a circular patch
+        /*
+        圆的半径为 HALF_PATCH_SIZE
+        计算每一行到圆边的像素距离
+        */
         umax.resize(HALF_PATCH_SIZE + 1);
 
         int v, v0, vmax = cvFloor(HALF_PATCH_SIZE * sqrt(2.f) / 2 + 1);
@@ -797,8 +804,10 @@ namespace ORB_SLAM3
             const float width = (maxBorderX-minBorderX);
             const float height = (maxBorderY-minBorderY);
 
+            // 期望将图片分成几个大小为35*35的patch
             const int nCols = width/W;
             const int nRows = height/W;
+            // 每个cell的宽度和高度
             const int wCell = ceil(width/nCols);
             const int hCell = ceil(height/nRows);
 
@@ -1083,6 +1092,26 @@ namespace ORB_SLAM3
             computeOrbDescriptor(keypoints[i], image, &pattern[0], descriptors.ptr((int)i));
     }
 
+    /*
+    总结下特征点抽取的过程
+    
+    1. 按照设置的scale和level，作图像金字塔，每层按缩放比例分配 要提取的特征点数量
+    2. for each pyramid:
+        1. 先将图像均分成数个35*35（实际上不一定是这个数，只能说是近似）的patch，分别用fast提角点。
+            1. 如果没提到，就降低Fast阈值，再提
+            2. 再没提到，就算球
+        2. 将上一步中得到的所有keypoints，基于4叉数，作均匀化
+            1. 先根据图像宽高比 分成 两个node或者一个node，并分配keypoints
+            2. 对每个node，可以分裂成4个node。比如说此时有 A/B/C/D/E/F 几个nodes。
+                按keypoints的数量，从多到少开始分裂这些nodes；被分裂的node要删除；
+                注意！是同一尺寸的node，才按kpts从多到少的顺序去分裂！因此，分裂结束后，四叉树中不会出现两个长度（或者说宽度）相差4倍的node
+            3. 四叉树node足够多后，就从每个node中选response最高的那个kpt
+        3. 计算每个kpt的angle
+    3. for each pyrmid
+        1. 高斯模糊（why?）
+        2. 计算每个kpt的描述子，在使用patch前，要先用kpt的angle转一下
+        3. 将每个kpt的坐标按比例投回原图像
+    */
     int ORBextractor::operator()( InputArray _image, InputArray _mask, vector<KeyPoint>& _keypoints,
                                   OutputArray _descriptors, std::vector<int> &vLappingArea)
     {

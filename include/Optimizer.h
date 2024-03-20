@@ -47,15 +47,29 @@ class Optimizer
 {
 public:
 
+    // 给定kf(会固定第一帧)、mappoints 使用BA优化pose+mappoints
     void static BundleAdjustment(const std::vector<KeyFrame*> &vpKF, const std::vector<MapPoint*> &vpMP,
                                  int nIterations = 5, bool *pbStopFlag=NULL, const unsigned long nLoopKF=0,
                                  const bool bRobust = true);
+    // 找出pMap中所有的kf和mappoint，并调用BundleAdjustment()
     void static GlobalBundleAdjustemnt(Map* pMap, int nIterations=5, bool *pbStopFlag=NULL,
                                        const unsigned long nLoopKF=0, const bool bRobust = true);
+    // 找出pMap中所有的kf和mappoint
+    // 重投影+预积分 优化 pose+vel+bias+mappoints
+    // bFixLocal会固定部分 帧(pose+vel+bias), 但在imu初始化调用这个函数时，就没有任何固定，但这样不会漂移吗？
     void static FullInertialBA(Map *pMap, int its, const bool bFixLocal=false, const unsigned long nLoopKF=0, bool *pbStopFlag=NULL, bool bInit=false, float priorG = 1e2, float priorA=1e6, Eigen::VectorXd *vSingVal = NULL, bool *bHess=NULL);
 
+    // 优化： pKF及其共视帧及这些帧能看到的mappoints
+    // 残差： 重投影误差
+    // 固定： 除优化帧外，看到mappoints的其他帧
     void static LocalBundleAdjustment(KeyFrame* pKF, bool *pbStopFlag, Map *pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges);
 
+    /*
+    这三个函数用于优化pFrame的pvb，使用pFrame中的mappoint作pnp。三个函数里都会检测outlier，这些outlier写入pFrame->mvbOutlier中。
+    函数一只用了BA
+    函数二还用了kf的imu约束，优化过程会固定kf的pvb
+    函数三用了prevframe的imu约束，并用prevframe pvb的先验约束
+    */
     int static PoseOptimization(Frame* pFrame);
     int static PoseInertialOptimizationLastKeyFrame(Frame* pFrame, bool bRecInit = false);
     int static PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit = false);
@@ -83,10 +97,15 @@ public:
 
     // For inertial systems
 
+    /*
+    优化pKF及共视帧及用imu关联的帧，mappoints
+    */
     void static LocalInertialBA(KeyFrame* pKF, bool *pbStopFlag, Map *pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges, bool bLarge = false, bool bRecInit = false);
+    
     void static MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbStopFlag, Map *pMap, LoopClosing::KeyFrameAndPose &corrPoses);
 
     // Local BA in welding area when two maps are merged
+    // 回环用
     void static LocalBundleAdjustment(KeyFrame* pMainKF,vector<KeyFrame*> vpAdjustKF, vector<KeyFrame*> vpFixedKF, bool *pbStopFlag);
 
     // Marginalize block element (start:end,start:end). Perform Schur complement.
@@ -94,8 +113,13 @@ public:
     static Eigen::MatrixXd Marginalize(const Eigen::MatrixXd &H, const int &start, const int &end);
 
     // Inertial pose-graph
+    // pose-graph, 优化s,g,vel,bias
     void static InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &scale, Eigen::Vector3d &bg, Eigen::Vector3d &ba, bool bMono, Eigen::MatrixXd  &covInertial, bool bFixedVel=false, bool bGauss=false, float priorG = 1e2, float priorA = 1e6);
+    
+    // 回环用
     void static InertialOptimization(Map *pMap, Eigen::Vector3d &bg, Eigen::Vector3d &ba, float priorG = 1e2, float priorA = 1e6);
+    
+    // pose-graph,优化s,g
     void static InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &scale);
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
